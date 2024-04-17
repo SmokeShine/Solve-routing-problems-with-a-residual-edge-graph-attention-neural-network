@@ -9,6 +9,8 @@ import copy
 import matplotlib.pyplot as plt
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader  # Using PyG Data utilities
+from torch.optim.lr_scheduler import LambdaLR
+from ppo_controller import PPOController
 
 logger = logging.getLogger(__name__)
 
@@ -60,209 +62,87 @@ def train(
     critic,
     device,
     data_loader,
+    valid_loader,
     criterion,
-    optimizer_forward_network,
-    optimizer_critic,
-    epochs,
+    epoch,
     batch_size,
     customercount,
+    ppo_epochs,
+    update_policies_at,
+    num_decoding_steps,
     print_freq=50,
 ):
-    # Create a copy for PPO
-    forward_network_old = copy.deepcopy(forward_network)
-    critic_old = copy.deepcopy(critic)
-    # should not be required. check and delete later
-    forward_network_old.load_state_dict(forward_network.state_dict())
-    critic_old.load_state_dict(critic.state_dict())
-    # Memory for sampling
-    memory = Memory()
-    # Push to device
-    forward_network_old.to(device)
-    critic_old.to(device)
-    forward_network.to(device)
-    critic.to(device)
+    controller = PPOController(ppo_epochs, update_policies_at, forward_network, critic)
+    memory = controller.memory
+    for i, data in enumerate(data_loader):
+        import pdb
 
-    forward_network_old.train()
-    critic_old.train()
+        pdb.set_trace()
 
-    losses_forward_network = AverageMeter()
-    losses_critic = AverageMeter()
-    total_losses = AverageMeter()
-    for epoch in range(epochs):
-        for i, data in enumerate(data_loader):
-            import pdb
+        # convert to batch for storing it in memory
+        # let it remain in RAM else it would have to be pushed back
+        # from GPU to CPU
+        edge_attr = data.edge_attr.view(batch_size, customercount * (customercount - 1))
+        demand = data.y.view(batch_size, customercount)
 
-            pdb.set_trace()
+        # push to GPU for training
+        data = data.to(device)
+        # Prepare training
+        controller.forward_network_old.train()
+        controller.optimizer_forward_network_old.zero_grad()
+        controller.optimizer_critic_old.zero_grad()
+        # Pass the batch through the network
+        # this can be random/greedy and a flag needs to be passed
 
-            # convert to batch for storing it in memory
-            # let it remain in RAM else it would have to be pushed back
-            # from GPU to CPU
-            edge_attr = data.edge_attr.view(
-                batch_size, customercount * (customercount - 1)
+        actions, log_p, entropy, dists, x = controller.forward_network_old(
+            data, 0, num_decoding_steps, batch_size, False, False
+        )
+        rewards = calculatedistance(
+            decoded_points=actions, alldistanceMatrix=data.distance_matrix
+        )
+        # Putting it back to cpu to save it to RAM instead of GPU memory
+        actions = actions.to(torch.device("cpu")).detach()
+        log_p = log_p.to(torch.device("cpu")).detach()
+        rewards = rewards.to(torch.device("cpu")).detach()
+        for i_batch in range(batch_size):
+            memory.input_x.append(x[i_batch])
+            memory.input_attr.append(edge_attr[i_batch])
+            memory.actions.append(actions[i_batch])
+            memory.log_probs.append(log_p[i_batch])
+            memory.rewards.append(rewards[i_batch])
+            memory.capacity.append(torch.tensor(forward_network_old.vehicle_capacity))
+            memory.demand.append(demand[i_batch])
+        if (i + 1) % update_policies_at == 0:
+            # Updating the new policies for both actor and critic using memory samples
+            controller.update_policies(memory, epoch)
+            # Clearing memory - fill memory with old policy before using
+            memory.clear_memory()
+        costs = []
+        cost = rollout(
+            controller.optimizer_forward_network,
+            valid_loader,
+            batch_size,
+            num_decoding_steps,
+        )
+        cost = cost.mean()
+        costs.append(cost.item())
+        print("Problem:TSP" "%s" % n_nodes, "/ Average distance:", cost.item())
+        print(costs)
+
+
+def rollout(forward_network, dataset, batch_size, steps):
+    forward_network.eval()
+
+    def eval_model_bat(bat):
+        with torch.no_grad():
+            actions, log_p, entropy, dists, x = forward_network(
+                bat, 0, steps, batch_size, True, False
             )
-            demand = data.y.view(batch_size, customercount)
 
-            # push to GPU for training
-            data = data.to(device)
-            # Prepare training
-            optimizer_forward_network.zero_grad()
-            optimizer_critic.zero_grad()
-            # Pass the batch through the network
-            actions, log_p, entropy, dists, x = forward_network_old(data)
             rewards = calculatedistance(
                 decoded_points=actions, alldistanceMatrix=data.distance_matrix
             )
-            # Putting it back to cpu to save it to RAM instead of GPU memory
-            actions = actions.to(torch.device("cpu")).detach()
-            log_p = log_p.to(torch.device("cpu")).detach()
-            rewards = rewards.to(torch.device("cpu")).detach()
-            for i_batch in range(batch_size):
-                memory.input_x.append(x[i_batch])
-                memory.input_attr.append(edge_attr[i_batch])
-                memory.actions.append(actions[i_batch])
-                memory.log_probs.append(log_p[i_batch])
-                memory.rewards.append(rewards[i_batch])
-                memory.capacity.append(
-                    torch.tensor(forward_network_old.vehicle_capacity)
-                )
-                memory.demand.append(demand[i_batch])
-            if (i + 1) % 4 == 0:
-                # Updating the new policy using memory samples
-                for i in range(old_input_x.size(0)):
-                    data = Data(
-                        x=old_input_x[i],
-                        edge_index=edges_index,
-                        edge_attr=old_input_attr[i],
-                        actions=old_action[i],
-                        rewards=old_rewards[i],
-                        log_probs=old_log_probs[i],
-                        demand=old_demand[i],
-                        capcity=old_capcity[i],
-                    )
-                    datas.append(data)
+        return rewards.cpu()
 
-                memory.clear_memory()
-
-            output_critic = critic(
-                location_embedding=static_location_embedding,
-                log_probabilities=output_actor_prob,
-            )
-
-            # target
-            rewards = calculatedistance(
-                decoded_points=output_actor_points, alldistanceMatrix=distanceMatrix
-            )
-            advantage = rewards - output_critic
-            pointer_reward = torch.max(output_actor_prob, axis=2)
-            # actor loss
-            # https://stackoverflow.com/questions/65815598/calling-backward-function-for-two-different-neural-networks-but-getting-retai
-            loss_actor = torch.mean(torch.sum(advantage * pointer_reward[0], axis=1))
-
-            # critic loss
-            loss_critic = torch.mean(torch.sum(torch.square(advantage), axis=1))
-            assert not np.isnan(loss_actor.item()), "Actor diverged with loss = NaN"
-            assert not np.isnan(loss_critic.item()), "Critic diverged with loss = NaN"
-
-            # Calculating total loss
-            total_loss = loss_actor + loss_actor
-            # calculating loss for end leaves of graph for both actor and critic
-            total_loss.backward()
-            # Clipping
-            nn.utils.clip_grad_norm_(
-                forward_network.parameters(), max_norm=2.0, norm_type=2
-            )
-            nn.utils.clip_grad_norm_(critic.parameters(), max_norm=2.0, norm_type=2)
-            # propogate loss back to critic graph
-            optimizer_critic.step()
-            # propogate loss back to actor graph
-            optimizer_forward_network.step()
-
-            # Updating Averagemeter
-            losses_forward_network.update(loss_actor.item(), output_critic.size(0))
-            losses_critic.update(loss_critic.item(), output_critic.size(0))
-            if i % print_freq == 0:
-                logger.info(
-                    f"Epoch: {epoch} \t iteration: {i} \t Training Loss Actor Current:{losses_forward_network.val:.4f} Average:({losses_forward_network.avg:.4f})"
-                )
-                logger.info(
-                    f"Epoch: {epoch} \t iteration: {i} \t Training Loss Critic Current:{losses_critic.val:.4f} Average:({losses_critic.avg:.4f})"
-                )
-
-    return [losses_forward_network.avg, losses_critic.avg]
-
-
-def evaluate(model, device, data_loader, criterion, optimizer, print_freq=10):
-    losses = AverageMeter()
-    model.eval()
-    with torch.no_grad():
-        for i, (data, target) in enumerate(data_loader):
-            data = data.to(device)
-            target = target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            losses.update(loss.item(), target.size(0))
-            if i % print_freq == 0:
-                logger.info(
-                    f"Validation Loss Current:{losses.val:.4f} Average:({losses.avg:.4f})"
-                )
-    return losses.avg
-
-
-def save_checkpoint(model, optimizer, path):
-    state = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
-    torch.save(state, path)
-    torch.save(model, "./checkpoint_model.pth", _use_new_zipfile_serialization=False)
-    logger.info(f"checkpoint saved at {path}")
-
-
-class Memory:
-    def __init__(self):
-        self.input_x = []
-        # self.input_index = []
-        self.input_attr = []
-        self.actions = []
-        self.rewards = []
-        self.log_probs = []
-        self.capacity = []
-        self.demand = []
-
-    def clear_memory(self):
-        self.input_x.clear()
-        # self.input_index.clear()
-        self.input_attr.clear()
-        self.actions.clear()
-        self.rewards.clear()
-        self.log_probs.clear()
-        self.capacity.clear()
-        self.demand.clear()
-
-
-class Actor_critic(nn.Module):
-    def __init__(
-        self,
-        input_node_dim,
-        hidden_node_dim,
-        input_edge_dim,
-        hidden_edge_dim,
-        conv_laysers,
-    ):
-        super(Actor_critic, self).__init__()
-        self.actor = ResidualEGAT()
-        self.critic = Critic()
-
-    def act(self, datas, actions, steps, batch_size, greedy, _action):
-        actions, log_p, _, _, _ = self.actor(
-            datas, actions, steps, batch_size, greedy, _action
-        )
-
-        return actions, log_p
-
-    def evaluate(self, datas, actions, steps, batch_size, greedy, _action):
-        _, _, entropy, old_log_p, x = self.actor(
-            datas, actions, steps, batch_size, greedy, _action
-        )
-
-        value = self.critic(x)
-
-        return entropy, old_log_p, value
+    totall_cost = torch.cat([eval_model_bat(bat.to(device)) for bat in dataset], 0)
+    return totall_cost

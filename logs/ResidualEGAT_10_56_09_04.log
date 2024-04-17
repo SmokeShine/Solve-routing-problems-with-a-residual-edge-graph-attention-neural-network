@@ -1,0 +1,12 @@
+2024-04-09 10:56:20,378 __main__     INFO     Namespace(customers=5, maxdemand=15, train=True, batch_size=128, num_workers=0, num_epochs=5, learning_rate=0.0001, sgd_momentum=0.0, plot_output_path='./Plots_', model_path=None, epoch_save_checkpoint=5, pred_model='./checkpoint_model.pth', patience=5)
+2024-04-09 10:56:20,378 __main__     INFO     Problem Size:5
+2024-04-09 10:56:20,378 __main__     INFO     Training
+2024-04-09 10:56:20,378 __main__     INFO     Generating DataLoader
+2024-04-09 10:56:20,378 __main__     INFO     Training Model
+2024-04-09 10:56:20,387 __main__     INFO     Actor: ResidualEGAT(
+  (actor): Actor()
+)
+2024-04-09 10:56:20,387 __main__     INFO     Critic: Critic(
+  (dense): Linear(in_features=128, out_features=10, bias=True)
+  (linear): Linear(in_features=10, out_features=1, bias=True)
+)

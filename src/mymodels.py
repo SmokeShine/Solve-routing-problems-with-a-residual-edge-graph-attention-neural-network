@@ -16,8 +16,8 @@ class ResidualEGAT(nn.Module):
             vehicle_capacity=self.vehicle_capacity
         )  # to be passed to decoder
 
-    def forward(self, x):
-        actions, log_p, entropy, dists, context_vector = self.actor(x)
+    def forward(self, data):
+        actions, log_p, entropy, dists, context_vector = self.actor(data)
         return actions, log_p, entropy, dists, context_vector
 
 
@@ -43,14 +43,16 @@ class Actor(nn.Module):
             vehicle_capacity=self.vehicle_capacity
         )  # Use vehicle capacity to mask nodes
 
-    def forward(self, x, actions_old, _action, n_steps=1, batch_size=512, greedy=False):
-        embedding_w_residual = self.encoder(x)
+    def forward(
+        self, data, actions_old, _action, n_steps=1, batch_size=512, greedy=False
+    ):
+        embedding_w_residual = self.encoder(data)
         context_vector = embedding_w_residual.mean(dim=1)  # Create a context vector 1x1
-        demand = x.y
+        demand = data.y
         capacity = self.vehicle_capacity
 
         actions, log_p, entropy, dists = self.decoder(
-            x,
+            data,
             context_vector,
             actions_old,
             capacity,
@@ -60,7 +62,7 @@ class Actor(nn.Module):
             greedy,
             _action,
         )
-        return actions, log_p, entropy, dists, x
+        return actions, log_p, entropy, dists, data
 
 
 class Encoder(nn.Module):
@@ -141,43 +143,6 @@ class GatConv(MessagePassing):
 
 
 # Change initialization of layers - paper publication
-# Official implementation of residual e-GAT is not multihead, but a simple attention layer
-class GaatConv(MessagePassing):
-    def __init__(self, in_channels, out_channels, edge_channels, num_heads=1):
-        super(GaatConv, self).__init__(aggr="add")
-        self.num_heads = num_heads
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.edge_channels = edge_channels
-        self.W = nn.Parameter(torch.Tensor(in_channels, out_channels * num_heads))
-        self.a = nn.Parameter(torch.Tensor(2 * out_channels, 1))
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.W.data)
-        nn.init.xavier_uniform_(self.a.data)
-
-    def forward(self, x, edge_index, edge_attr):
-        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
-
-    def message(self, x_i, x_j, edge_index, size_i):
-        # Compute attention coefficients
-        x_i = x_i.view(-1, self.num_heads, self.out_channels)
-        x_j = x_j.view(-1, self.num_heads, self.out_channels)
-
-        alpha = nn.LeakyReLU(
-            (torch.cat([x_i, x_j], dim=-1) * self.a).sum(-1), negative_slope=0.2
-        )
-
-        # Normalize attention scores
-        alpha = F.softmax(alpha, dim=1)
-
-        return x_j * alpha.view(-1, self.num_heads, 1)
-
-    # The update method is overridden to define how received messages are aggregated to update node representations
-    def update(self, aggr_out):
-        return aggr_out.view(-1, self.num_heads * self.out_channels)
 
 
 # multi head attention, followed by attention
@@ -468,203 +433,3 @@ class Critic(nn.Module):
         output = torch.relu(self.fc2(output))
         value = self.fc3(output).sum(dim=2).squeeze(-1)
         return value
-
-
-class Agentppo:
-    def __init__(
-        self,
-        steps,
-        greedy,
-        lr,
-        input_node_dim,
-        hidden_node_dim,
-        input_edge_dim,
-        hidden_edge_dim,
-        epoch=1,
-        batch_size=32,
-        conv_laysers=3,
-        entropy_value=0.2,
-        eps_clip=0.2,
-    ):
-        self.policy = Actor_critic(
-            input_node_dim,
-            hidden_node_dim,
-            input_edge_dim,
-            hidden_edge_dim,
-            conv_laysers,
-        )
-        self.old_polic = Actor_critic(
-            input_node_dim,
-            hidden_node_dim,
-            input_edge_dim,
-            hidden_edge_dim,
-            conv_laysers,
-        )
-        self.old_polic.load_state_dict(self.policy.state_dict())
-
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
-        self.MseLoss = nn.MSELoss()
-        self.batch_size = batch_size
-        self.epoch = epoch
-        self.steps = steps
-        self.entropy_value = entropy_value
-        self.eps_clip = eps_clip
-        self.greedy = greedy
-        self._action = True
-        self.conv_layers = conv_laysers
-        self.input_node_dim = input_node_dim
-        self.input_edge_dim = input_edge_dim
-        self.hidden_node_dim = hidden_node_dim
-        self.hidden_edge_dim = hidden_edge_dim
-        self.batch_idx = 1
-        self.times, self.losses, self.rewards, self.critic_rewards = [], [], [], []
-
-    def adv_normalize(self, adv):
-        std = adv.std()
-        assert std != 0.0 and not torch.isnan(std), "Need nonzero std"
-        n_advs = (adv - adv.mean()) / (adv.std() + 1e-8)
-        return n_advs
-
-    def value_loss_gae(self, val_targ, old_vs, value_od, clip_val):
-        vs_clipped = old_vs + torch.clamp(old_vs - value_od, -clip_val, +clip_val)
-        val_loss_mat_unclipped = self.MseLoss(old_vs, val_targ)
-        val_loss_mat_clipped = self.MseLoss(vs_clipped, val_targ)
-
-        val_loss_mat = torch.max(val_loss_mat_unclipped, val_loss_mat_clipped)
-
-        mse = val_loss_mat
-
-        return mse
-
-    def update(self, memory, epoch):
-        old_input_x = torch.stack(memory.input_x)
-        # old_input_index = torch.stack(memory.input_index)
-        old_input_attr = torch.stack(memory.input_attr)
-        old_demand = torch.stack(memory.demand)
-        old_capcity = torch.stack(memory.capcity)
-
-        old_action = torch.stack(memory.actions)
-        old_rewards = torch.stack(memory.rewards).unsqueeze(-1)
-        old_log_probs = torch.stack(memory.log_probs).unsqueeze(-1)
-
-        datas = []
-        edges_index = []
-        for i in range(n_nodes):
-            for j in range(n_nodes):
-                edges_index.append([i, j])
-        edges_index = torch.LongTensor(edges_index)
-        edges_index = edges_index.transpose(dim0=0, dim1=1)
-        for i in range(old_input_x.size(0)):
-            data = Data(
-                x=old_input_x[i],
-                edge_index=edges_index,
-                edge_attr=old_input_attr[i],
-                actions=old_action[i],
-                rewards=old_rewards[i],
-                log_probs=old_log_probs[i],
-                demand=old_demand[i],
-                capcity=old_capcity[i],
-            )
-            datas.append(data)
-        # print(np.array(datas).shape)
-        self.policy.to(device)
-        data_loader = DataLoader(datas, batch_size=self.batch_size, shuffle=False)
-        # 学习率退火
-        scheduler = LambdaLR(self.optimizer, lr_lambda=lambda f: 0.96**epoch)
-        value_buffer = 0
-
-        for i in range(self.epoch):
-
-            self.policy.train()
-            epoch_start = time.time()
-            start = epoch_start
-            self.times, self.losses, self.rewards, self.critic_rewards = [], [], [], []
-
-            for batch_idx, batch in enumerate(data_loader):
-                self.batch_idx += 1
-                batch = batch.to(device)
-                entropy, log_probs, value = self.policy.evaluate(
-                    batch,
-                    batch.actions,
-                    self.steps,
-                    self.batch_size,
-                    self.greedy,
-                    self._action,
-                )
-                # advangtage function
-
-                # base_reward = self.adv_normalize(base_reward)
-                rewar = batch.rewards
-                rewar = self.adv_normalize(rewar)
-                # rewar = rewar/torch.max(rewar)
-                # Value function clipping
-                mse_loss = self.MseLoss(rewar, value)
-
-                ratios = torch.exp(log_probs - batch.log_probs)
-
-                # norm advantages
-                advantages = rewar - value.detach()
-
-                # advantages = self.adv_normalize(advantages)
-                # PPO loss
-                surr1 = ratios * advantages
-                surr2 = (
-                    torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip)
-                    * advantages
-                )
-                # total loss
-                loss = (
-                    torch.min(surr1, surr2)
-                    + 0.5 * mse_loss
-                    - self.entropy_value * entropy
-                )
-                self.optimizer.zero_grad()
-                loss.mean().backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), max_grad_norm)
-                self.optimizer.step()
-
-                scheduler.step()
-
-                self.rewards.append(torch.mean(rewar.detach()).item())
-                self.losses.append(torch.mean(loss.detach()).item())
-                # print(epoch,self.optimizer.param_groups[0]['lr'])
-
-        self.old_polic.load_state_dict(self.policy.state_dict())
-
-
-def update_state(demand, dynamic_capcity, selected, c=20):  # dynamic_capcity(num,1)
-
-    depot = selected.squeeze(-1).eq(0)  # Is there a group to access the depot
-
-    current_demand = torch.gather(demand, 1, selected)
-
-    dynamic_capcity = dynamic_capcity - current_demand
-    if depot.any():
-        dynamic_capcity[depot.nonzero().squeeze()] = c
-
-    return dynamic_capcity.detach()  # (bach_size,1)
-
-
-def update_mask(demand, capcity, selected, mask, i):
-    go_depot = selected.squeeze(-1).eq(
-        0
-    )  # If there is a route to select a depot, mask the depot, otherwise it will not mask the depot
-    # print(go_depot.nonzero().squeeze())
-    # visit = selected.ne(0)
-
-    mask1 = mask.scatter(1, selected.expand(mask.size(0), -1), 1)
-
-    if (~go_depot).any():
-        mask1[(~go_depot).nonzero(), 0] = 0
-
-    if i + 1 > demand.size(1):
-        is_done = (mask1[:, 1:].sum(1) >= (demand.size(1) - 1)).float()
-        combined = is_done.gt(0)
-        mask1[combined.nonzero(), 0] = 0
-        """for i in range(demand.size(0)):
-            if not mask1[i,1:].eq(0).any():
-                mask1[i,0] = 0"""
-    a = demand > capcity
-    mask = a + mask1
-
-    return mask.detach(), mask1.detach()

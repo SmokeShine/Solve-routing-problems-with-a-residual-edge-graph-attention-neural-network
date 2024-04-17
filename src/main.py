@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+
 # from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader  # Using PyG Data utilities
@@ -141,27 +142,7 @@ def train_model(model_name="ResidualEGAT"):
     logger.info(f"Forward Network: {forward_network}")
     logger.info(f"Critic: {critic}")
     save_file = "ResidualEGAT.pth"
-    # do this after copying
-    # forward_network.to(DEVICE)
-    # critic.to(DEVICE)
 
-    optimizer_forward_network = optim.Adam(
-        forward_network.parameters(), lr=LEARNING_RATE
-    )
-    optimizer_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE)
-    if MODEL_PATH != None:
-        # Actor
-        checkpoint = torch.load(MODEL_PATH[0])
-        forward_network.load_state_dict(checkpoint["model"])
-        optimizer_forward_network.load_state_dict(checkpoint["optimizer"])
-        logger.info(f"Loaded Checkpoint from {MODEL_PATH[0]}")
-        # Critic
-        checkpoint = torch.load(MODEL_PATH[1])
-        critic.load_state_dict(checkpoint["model"])
-        optimizer_forward_network.load_state_dict(checkpoint["optimizer"])
-        logger.info(f"Loaded Checkpoint from {MODEL_PATH[1]}")
-        logger.info(forward_network)
-        logger.info(critic)
     train_dataset = SequenceWithLabelDataset(
         input_cities=CUSTOMERCOUNT,
         ninstances=10,  # 1 million instances,
@@ -194,17 +175,20 @@ def train_model(model_name="ResidualEGAT"):
     early_stopping_counter = 0
     for epoch in range(1, NUM_EPOCHS + 1):
         logger.info(f"Epoch {epoch}")
+
         train_loss = train(
             forward_network,
             critic,
             DEVICE,
             train_loader,
+            valid_loader,
             criterion,
-            optimizer_forward_network,
-            optimizer_critic,
             epoch,
             BATCH_SIZE,
             CUSTOMERCOUNT,
+            PPO_EPOCH,
+            UPDATE_POLICIES_AT,
+            NUM_DECODING_STEPS,
         )
         logger.info(
             f"Forward Network: Average Loss for epoch {epoch} is {train_loss[0]}"
@@ -320,6 +304,20 @@ def parse_args():
         help="Number of Epochs for PPO",
     )
     parser.add_argument(
+        "--update_policies_at",
+        nargs="?",
+        type=int,
+        default=4,
+        help="Use samples from memory to update the policies",
+    )
+    parser.add_argument(
+        "--num_decoding_steps",
+        nargs="?",
+        type=int,
+        default=1000,
+        help="Use samples from memory to update the policies",
+    )
+    parser.add_argument(
         "--learning_rate",
         nargs="?",
         type=float,
@@ -356,7 +354,7 @@ if __name__ == "__main__":
 
     CUSTOMERCOUNT = args.customers
 
-    global BATCH_SIZE, NUM_EPOCHS, NUM_WORKERS, LEARNING_RATE, PRED_MODEL, PATIENCE, MAXDEMAND, PPO_EPOCH
+    global BATCH_SIZE, NUM_EPOCHS, NUM_WORKERS, LEARNING_RATE, PRED_MODEL, PATIENCE, MAXDEMAND, PPO_EPOCH, UPDATE_POLCIIES_AT, NUM_DECODING_STEPS
     MAXDEMAND = args.maxdemand
     PPO_EPOCH = args.ppo_epoch
     __train__ = args.train
@@ -364,13 +362,14 @@ if __name__ == "__main__":
     NUM_WORKERS = args.num_workers
     NUM_EPOCHS = args.num_epochs
     LEARNING_RATE = args.learning_rate
-
+    UPDATE_POLICIES_AT = args.update_policies_at
     PLOT_OUTPUT_PATH = args.plot_output_path
     EPOCH_SAVE_CHECKPOINT = args.epoch_save_checkpoint
     MODEL_PATH = args.model_path
     PATIENCE = args.patience
     PRED_MODEL = args.pred_model
     DEVICE = torch.device("mps")
+    NUM_DECODING_STEPS = args.num_decoding_steps
 
     logger.info(f"Problem Size:{CUSTOMERCOUNT}")
 
